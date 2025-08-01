@@ -806,6 +806,7 @@ def push(model_path: str, existing_repo: str, revision: str, coldkey: str, hotke
     # 8. Deploy Chute
     # -----------------------------------------------------------------------------
     async def deploy_to_chutes():
+        """Deploy sanitized configuration to Chutes."""
         logger.debug("Building Chute config")
         rev_flag = f'revision={json.dumps(revision)},' if revision else ""
         chutes_config = textwrap.dedent(
