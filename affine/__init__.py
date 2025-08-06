@@ -15,6 +15,7 @@ import hashlib
 import aiohttp
 import asyncio
 import logging
+import aiofiles
 import textwrap
 import traceback
 import itertools
@@ -237,16 +238,18 @@ ENVS = {"SAT": SAT, "ABD": ABD, "DED": DED}
 # --------------------------------------------------------------------------- #
 #                   S3 helpers                                                #
 # --------------------------------------------------------------------------- #
-# ── ENV ──────────────────────────────────────────────────────────────────────
+CONCUR        = 25
 WINDOW        = int(os.getenv("AFFINE_WINDOW", 20))
 RESULT_PREFIX = "affine/results/"
 INDEX_KEY     = "affine/index.json"
-
-FOLDER  = os.getenv("R2_FOLDER", "affine" )
-BUCKET  = os.getenv("R2_BUCKET_ID", "80f15715bb0b882c9e967c13e677ed7d" )
-ACCESS  = os.getenv("R2_WRITE_ACCESS_KEY_ID", "ff3f4f078019b064bfb6347c270bee4d")
-SECRET  = os.getenv("R2_WRITE_SECRET_ACCESS_KEY", "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
-ENDPOINT = f"https://{BUCKET}.r2.cloudflarestorage.com"
+FOLDER        = os.getenv("R2_FOLDER",  "affine")
+BUCKET        = os.getenv("R2_BUCKET_ID", "80f15715bb0b882c9e967c13e677ed7d")
+ACCESS        = os.getenv("R2_WRITE_ACCESS_KEY_ID", "ff3f4f078019b064bfb6347c270bee4d")
+SECRET        = os.getenv("R2_WRITE_SECRET_ACCESS_KEY", "a94b20516013519b2959cbbb441b9d1ec8511dce3c248223d947be8e85ec754d")
+ENDPOINT      = f"https://{BUCKET}.r2.cloudflarestorage.com"
+CACHE_DIR     = Path(os.getenv("AFFINE_CACHE_DIR", Path.home() / ".cache" / "affine" / "blocks"))
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+def _w(b: int) -> int: return (b // WINDOW) * WINDOW
 
 get_client_ctx = lambda: get_session().create_client(
     "s3", endpoint_url=ENDPOINT,
@@ -254,136 +257,124 @@ get_client_ctx = lambda: get_session().create_client(
     config=Config(max_pool_connections=256)
 )
 
-CACHE_DIR = Path(os.getenv("AFFINE_CACHE_DIR",
-                 Path.home() / ".cache" / "affine" / "blocks"))
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-def _w(b: int) -> int: return (b // WINDOW) * WINDOW
-
-# ── fast JSON ───────────────────────────────────────────────────────────────
+# ── JSON helpers ─────────────────────────────────────────────────────────────
 try:
     import orjson as _json
     _loads, _dumps = _json.loads, _json.dumps
 except ModuleNotFoundError:
     _loads = lambda b: json.loads(b.decode())
     _dumps = lambda o: json.dumps(o, separators=(",", ":")).encode()
-    
-# ── Index helpers ───────────────────────────────────────────────────────────
+
+# ── S3 index helpers ────────────────────────────────────────────────────────
 async def _index() -> list[str]:
     async with get_client_ctx() as c:
         r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
         return json.loads(await r["Body"].read())
-
-async def _update_index(k: str) -> None:
+    
+async def _update_index(key: str) -> None:
     async with get_client_ctx() as c:
         try:
-            r = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
+            r   = await c.get_object(Bucket=FOLDER, Key=INDEX_KEY)
             idx = set(json.loads(await r["Body"].read()))
-        except c.exceptions.NoSuchKey:
-            idx = set()
-        if k not in idx:
-            idx.add(k)
+        except c.exceptions.NoSuchKey: idx = set()
+        if key not in idx:
+            idx.add(key)
             await c.put_object(Bucket=FOLDER, Key=INDEX_KEY,
                                Body=_dumps(sorted(idx)),
                                ContentType="application/json")
 
-# ── Shard cache ─────────────────────────────────────────────────────────────
-async def _cache_shard(key: str, sem: asyncio.Semaphore) -> Path:
-    name, out = Path(key).name, None
-    out = CACHE_DIR / f"{name}.jsonl"; mod = out.with_suffix(".modified")
-    async with sem, get_client_ctx() as c:
-        if out.exists() and mod.exists():
-            h = await c.head_object(Bucket=FOLDER, Key=key)
-            if h["LastModified"].isoformat() == mod.read_text().strip():
-                return out
-        o = await c.get_object(Bucket=FOLDER, Key=key)
-        body, lm = await o["Body"].read(), o["LastModified"].isoformat()
-    tmp = out.with_suffix(".tmp")
-    with tmp.open("wb") as f:
-        f.write(b"\n".join(_dumps(i) for i in _loads(body)) + b"\n")
-    os.replace(tmp, out); mod.write_text(lm)
-    return out
-
-# ── Local JSON‑Lines iterator ───────────────────────────────────────────────
-async def _jsonl(p: Path):
-    try:
-        import aiofiles
-        async with aiofiles.open(p, "rb") as f:
-            async for l in f: yield l.rstrip(b"\n")
-    except ModuleNotFoundError:
-        def _read():                         # run in thread
-            with p.open("rb") as f: return f.read().splitlines()
-        for l in await asyncio.to_thread(_read): yield l
-
-# ── Core async stream (Result objects) ──────────────────────────────────────
-async def dataset(
-    tail: int,
-    *,
-    max_concurrency: int = 10,      # parallel S3 downloads
-) -> AsyncIterator["Result"]:
-    """
-    Stream `Result`s in deterministic order while pre‑downloading future
-    shards concurrently.
-    """
-    # ── figure out which windows we need ────────────────────────────────
+# ── shard discovery ─────────────────────────────────────────────────────────
+async def _shard_keys(tail: int) -> list[str]:
     sub  = await get_subtensor()
     cur  = await sub.get_current_block()
     need = {w for w in range(_w(cur - tail), _w(cur) + WINDOW, WINDOW)}
-    keys = [
-        k for k in await _index()
-        if (h := Path(k).name.split("-", 1)[0]).isdigit() and int(h) in need
-    ]
-    keys.sort()    
-    # ── helpers ────────────────────────────────
-    sem = asyncio.Semaphore(max_concurrency)     # throttle S3
-    async def _prefetch(key: str) -> Path:       # just downloads / caches
-        return await _cache_shard(key, sem)
-    tasks: list[asyncio.Task[Path]] = [
-        asyncio.create_task(_prefetch(k)) for k in keys[:max_concurrency]
-    ]
-    next_key = max_concurrency            
-    bar = tqdm(f"Dataset=({cur}, {cur - tail})", unit="res", dynamic_ncols=True)
-    # ── main loop: iterate over keys in order ───────────────────────────
+    keys = [k for k in await _index()
+            if (h := Path(k).name.split("-", 1)[0]).isdigit()
+            and int(h) in need]
+    keys.sort()
+    return keys
+
+# ── cache helpers ───────────────────────────────────────────────────────────
+async def _cache_shard(key: str, sem: asyncio.Semaphore) -> Path:
+    """Download a shard and store it as <CACHE_DIR>/<name>.jsonl."""
+    out   = CACHE_DIR / f"{Path(key).name}.jsonl"
+    stamp = out.with_suffix(".modified")
+    async with sem, get_client_ctx() as c:
+        if out.exists() and stamp.exists():
+            if (await c.head_object(Bucket=FOLDER,
+                                    Key=key))["LastModified"].isoformat() \
+               == stamp.read_text().strip():
+                return out
+        obj  = await c.get_object(Bucket=FOLDER, Key=key)
+        body = await obj["Body"].read()
+        lm   = obj["LastModified"].isoformat()
+    tmp = out.with_suffix(".tmp")
+    tmp.write_bytes(b"\n".join(_dumps(i) for i in _loads(body)) + b"\n")
+    os.replace(tmp, out); stamp.write_text(lm)
+    return out
+
+async def _jsonl(path: Path):
+    """Async-iterate over lines in a local .jsonl file."""
+    try:
+        async with aiofiles.open(path, "rb") as f:
+            async for l in f: yield l.rstrip(b"\n")
+    except ModuleNotFoundError:
+        for l in path.read_bytes().splitlines(): yield l
+
+# ── public helpers ──────────────────────────────────────────────────────────
+async def prefetch(tail: int, max_concurrency: int = CONCUR) -> None:
+    """Download all shards for the trailing `tail` blocks into CACHE_DIR."""
+    sem  = asyncio.Semaphore(max_concurrency)
+    keys = await _shard_keys(tail)
+    await asyncio.gather(*(_cache_shard(k, sem) for k in keys))
+
+async def dataset(tail: int, max_concurrency: int = CONCUR) -> AsyncIterator["Result"]:
+    """Yield verified Result objects in deterministic order."""
+    keys  = await _shard_keys(tail)
+    sem   = asyncio.Semaphore(max_concurrency)
+    tasks = [asyncio.create_task(_cache_shard(k, sem)) for k in keys[:max_concurrency]]
+    nxt   = max_concurrency
+    bar   = tqdm(total=0, unit="res", dynamic_ncols=True, desc="Results")
     for i, key in enumerate(keys):
         path = await tasks[i]
-        if next_key < len(keys):
-            tasks.append(asyncio.create_task(_prefetch(keys[next_key])))
-            next_key += 1
+        if nxt < len(keys):
+            tasks.append(asyncio.create_task(_cache_shard(keys[nxt], sem)))
+            nxt += 1
         async for raw in _jsonl(path):
             try:
                 r = Result.model_validate(_loads(raw))
-                if r.verify():
-                    bar.update(1)
-                    yield r
+                if r.verify(): bar.update(1); yield r
             except Exception:
                 pass
     bar.close()
-
-# ── Minimal sink / misc helpers (optional) ──────────────────────────────────
-async def sink(wallet: bt.wallet, results: list["Result"], block: int = None):
+    
+async def sink(wallet: "bt.wallet", results: list["Result"], block: int | None = None) -> None:
+    """Upload signed Result shard for `block` and update global index."""
     if not results: return
-    if block is None:
-        sub = await get_subtensor(); block = await sub.get_current_block()
-    key = f"{RESULT_PREFIX}{_w(block):09d}-{wallet.hotkey.ss58_address}.json"
-    new = [r.sign(wallet) or r.model_dump(mode="json") for r in results]
+    sub = await get_subtensor()
+    block = block or await sub.get_current_block()
+    key   = f"{RESULT_PREFIX}{_w(block):09d}-{wallet.hotkey.ss58_address}.json"
+    payload = [r.sign(wallet) or r.model_dump(mode="json") for r in results]
     async with get_client_ctx() as c:
         try:
-            r = await c.get_object(Bucket=FOLDER, Key=key)
-            merged = json.loads(await r["Body"].read()) + new
+            r        = await c.get_object(Bucket=FOLDER, Key=key)
+            merged   = json.loads(await r["Body"].read()) + payload
         except c.exceptions.NoSuchKey:
-            merged = new
-        await c.put_object(Bucket=FOLDER, Key=key, Body=_dumps(merged),
+            merged = payload
+        await c.put_object(Bucket=FOLDER, Key=key,
+                           Body=_dumps(merged),
                            ContentType="application/json")
-    if len(merged) == len(new):              # shard was new
+    if len(merged) == len(payload):                       # new shard
         await _update_index(key)
 
+# ── pruning helper (optional) ───────────────────────────────────────────────
 async def prune(tail: int):
-    sub = await get_subtensor(); cur = await sub.get_current_block()
+    """Delete cached shards older than `tail` blocks."""
+    cur = await (await get_subtensor()).get_current_block()
     for f in CACHE_DIR.glob("*.jsonl"):
-        b = f.name.split("-", 1)[0]
-        if b.isdigit() and int(b) < cur - tail:
-            try: f.unlink()
-            except OSError: pass
+        b = f.stem.split("-", 1)[0]
+        if b.isdigit() and int(b) < cur - tail: f.unlink(missing_ok=True)
+
 
 # --------------------------------------------------------------------------- #
 #                               QUERY                                         #
@@ -625,7 +616,6 @@ async def retry_set_weights( wallet: bt.Wallet, best_uid:int, retry: int = 10 ):
             continue
         
 TAIL= 10_000
-ALPHA = 0.9
 async def get_weights(tail=TAIL):
     st = await get_subtensor()
     blk = await st.get_current_block()
@@ -697,7 +687,7 @@ async def get_weights(tail=TAIL):
         + [f"{e}N"   for e in ENVS] \
         + ["Dom","Wgt"]
     rows = sorted([
-        [m.uid, m.model, m.revision[:5]]
+        [m.uid, m.model.split('/')[1][:20], m.revision[:5]]
         + [f"{100*acc[hk][e]:.2f}" for e in ENVS]
         + [ranks[e][hk]     for e in ENVS]
         + [cnt[hk][e]       for e in ENVS]
@@ -716,8 +706,12 @@ async def get_weights(tail=TAIL):
                 RANK.labels(uid=uid, env=e).set(ranks[e][hk])
 
     return best_uid, best
-
-
+    
+@cli.command("weights")
+@click.option('--tail','-t', default=TAIL, help="Results from tail blocks.")
+def weights(tail:int): 
+    """Computes current scores based on tail results."""
+    asyncio.run(get_weights(tail=tail))
         
 @cli.command("validate")
 def validate():
@@ -735,8 +729,10 @@ def validate():
                 HEARTBEAT = time.monotonic()
                 if subtensor is None: subtensor = await get_subtensor()
                 BLOCK = await subtensor.get_current_block()
+                x = (BLOCK % TEMPO != 0 or BLOCK <= LAST) and (TEMPO - (BLOCK % TEMPO)) if BLOCK > LAST else 0
                 if BLOCK % TEMPO != 0 or BLOCK <= LAST: 
-                    logger.debug(f'Waiting ... {BLOCK} % {TEMPO} == {BLOCK % TEMPO} != 0')
+                    logger.info(f"Prefetching, {TEMPO-x}/{TEMPO} blocks until set weights ...")
+                    await prefetch( TAIL )
                     await subtensor.wait_for_block()
                     continue
                 
@@ -769,10 +765,6 @@ def validate():
         )
     asyncio.run(main())
     
-    
-@cli.command("weights")
-def weights():
-    asyncio.run(get_weights())
 
 # --------------------------------------------------------------------------- #
 #                              Pull Model                                     #
