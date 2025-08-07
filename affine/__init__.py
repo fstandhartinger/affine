@@ -379,7 +379,28 @@ async def prune(tail: int):
 # --------------------------------------------------------------------------- #
 #                               QUERY                                         #
 # --------------------------------------------------------------------------- #
-HTTP_SEM = asyncio.Semaphore(int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16")))
+# Fix: Create HTTP semaphore per event loop to avoid Docker isolation issues
+_HTTP_SEM = None
+
+def get_http_semaphore():
+    """Get or create HTTP semaphore for current event loop"""
+    global _HTTP_SEM
+    try:
+        # Check if we're in an event loop
+        loop = asyncio.get_running_loop()
+        
+        # If semaphore doesn't exist or belongs to different loop, create new one
+        if _HTTP_SEM is None or getattr(_HTTP_SEM, '_loop', None) != loop:
+            concurrency = int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16"))
+            _HTTP_SEM = asyncio.Semaphore(concurrency)
+            # Store reference to loop for checking
+            _HTTP_SEM._loop = loop
+            
+        return _HTTP_SEM
+    except RuntimeError:
+        # No event loop running, create without loop reference
+        concurrency = int(os.getenv("AFFINE_HTTP_CONCURRENCY", "16"))
+        return asyncio.Semaphore(concurrency)
 TERMINAL = {400, 404, 410}
 async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm", timeout=150, retries=0, backoff=1) -> Response:
     url = f"https://{slug}.chutes.ai/v1/chat/completions"
@@ -392,7 +413,9 @@ async def query(prompt, model: str = "unsloth/gemma-3-12b-it", slug: str = "llm"
         for attempt in range(1, retries+2):
             try:
                 payload = {"model": model, "messages": [{"role": "user", "content": prompt}]}
-                async with HTTP_SEM, sess.post(url, json=payload,
+                # Fix: Use event loop specific semaphore
+                http_sem = get_http_semaphore()
+                async with http_sem, sess.post(url, json=payload,
                                                headers=hdr, timeout=timeout) as r:
                     txt = await r.text(errors="ignore")
                     if r.status in TERMINAL: return R(None, attempt, f"{r.status}:{txt}", False)
