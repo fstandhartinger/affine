@@ -6,8 +6,6 @@ import asyncio
 import subprocess
 from typing import Any, Dict, List, Tuple
 
-import affine as af
-
 
 def _normalize(text: str) -> str:
     """Trim trailing blank lines and per‑line trailing spaces."""
@@ -72,7 +70,7 @@ def _compat_extract_tests(row: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 async def evaluate_program(
-    executor: af.utils.ProgramExecutor,
+    executor,
     program: str,
     row: Dict[str, Any],
 ) -> Tuple[float, Dict[str, Any]]:
@@ -144,4 +142,3 @@ async def evaluate_program(
 
     score = 1.0 if total > 0 and passed == total else 0.0
     return score, {"passed": passed, "total": total, "tests": details}
-
