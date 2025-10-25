@@ -3,6 +3,7 @@ import time
 import socket
 import asyncio
 import logging
+from collections import defaultdict
 import aiohttp
 import bittensor as bt
 from typing import List, Tuple
@@ -132,8 +133,6 @@ async def get_weights(tail: int = SamplingConfig.TAIL, burn: float = 0.0):
     queryable_hks = {m.hotkey for m in queryable_miners.values()}
     logger.info(f"Found {len(queryable_hks)} queryable miners (hot, valid chute, not gated)")
 
-    results_list = []
-    
     initial_first_block = {}
     try:
         commits = await st.get_all_revealed_commitments(NETUID)
@@ -145,18 +144,74 @@ async def get_weights(tail: int = SamplingConfig.TAIL, burn: float = 0.0):
         pass
 
     logger.info(f"Loading data from {blk - tail} to {blk}")
-    async for c in dataset(tail=tail):
-        results_list.append(c)
 
-    logger.info("Collected results.")
+    cnt = {hk: defaultdict(int) for hk in meta.hotkeys}
+    succ = {hk: defaultdict(int) for hk in meta.hotkeys}
+    prev = {}
+    v_id = {}
+    first_block = {}
+    env_first_block = {hk: {e: float('inf') for e in ENVS} for hk in meta.hotkeys}
+    total_results = 0
 
-    if not results_list:
+    async for result in dataset(tail=tail):
+        total_results += 1
+        hk = result.miner.hotkey
+        env = result.challenge.env
+
+        if hk not in cnt:
+            continue
+
+        try:
+            name = result.miner.model.split("/", 1)[1].lower()
+        except Exception:
+            name = str(result.miner.model).lower()
+
+        if hk != BASE_HK and not name.startswith("affine"):
+            continue
+
+        cur_vid = (result.miner.model, result.miner.revision)
+
+        if v_id.get(hk) != cur_vid:
+            v_id[hk] = cur_vid
+            first_block[hk] = result.miner.block
+            for e in ENVS:
+                cnt[hk][e] = 0
+                succ[hk][e] = 0
+                env_first_block[hk][e] = float('inf')
+        else:
+            try:
+                fb = int(first_block.get(hk, result.miner.block)) if first_block.get(hk) is not None else int(result.miner.block)
+                cb = int(result.miner.block) if result.miner.block is not None else fb
+                first_block[hk] = fb if fb <= cb else cb
+            except Exception:
+                pass
+
+        prev[hk] = result
+        cnt[hk][env] += 1
+        normalized_score = SamplingConfig.normalize_score(float(result.evaluation.score), env)
+        succ[hk][env] += normalized_score
+
+        try:
+            block_num = int(result.miner.block)
+            if block_num < env_first_block[hk][env]:
+                env_first_block[hk][env] = block_num
+        except Exception:
+            pass
+
+    logger.info(f"Collected {total_results} results.")
+
+    if total_results == 0:
         logger.warning("No results collected; defaulting to uid 0")
         return [0], [1.0]
-    
-    cnt, succ, prev, v_id, first_block, stats = orchestrator.process_sample_data(
-        results_list, meta.hotkeys, ENVS, BASE_HK
-    )
+
+    stats = {hk: {} for hk in meta.hotkeys}
+    for hk in meta.hotkeys:
+        for e in ENVS:
+            stats[hk][e] = {
+                'samples': cnt[hk][e],
+                'total_score': succ[hk][e],
+                'first_block': env_first_block[hk][e] if env_first_block[hk][e] != float('inf') else first_block.get(hk, float('inf'))
+            }
     
     for hk, blk_val in initial_first_block.items():
         if hk not in first_block:
